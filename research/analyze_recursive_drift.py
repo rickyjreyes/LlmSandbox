@@ -2,8 +2,9 @@
 """Analyze JSONL logs produced by run_recursive_drift.py.
 
 Metrics are descriptive. Initial relationship assignment is separated from
-recurrent amplification, and malformed/self targets are excluded from the
-scientific trajectory summary.
+recurrent amplification. Relationship proposals rejected by the research
+wrapper are reported separately from invalid relationship state that actually
+reached the simulation.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ LABEL_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
     r"\bdanger(?:ous)?\b",
     r"\bthreat(?:s|ened|ening)?\b",
     r"\bhostile\b",
-    r"\benemy|enemies\b",
+    r"\b(?:enemy|enemies)\b",
     r"\bsuspicious\b",
     r"\buntrust(?:ed|worthy|ing)?\b",
     r"\battack(?:s|ed|ing)?\b",
@@ -42,8 +43,7 @@ def latest_log() -> Path:
 
 
 def contains_label(text: str) -> bool:
-    s = text or ""
-    return any(p.search(s) for p in LABEL_PATTERNS)
+    return any(p.search(text or "") for p in LABEL_PATTERNS)
 
 
 def classify_relationship(before: float, after: float, existed_before: bool,
@@ -85,7 +85,8 @@ def analyze(path: Path, output_dir: Path) -> dict:
                     known_ids.add(str(ent["id"]))
 
     trajectory_rows = []
-    rejected_relationship_rows = []
+    rejected_proposal_rows = []
+    invalid_applied_rows = []
     label_memory_updates = []
     label_speeches = []
     interventions = []
@@ -103,6 +104,7 @@ def analyze(path: Path, output_dir: Path) -> dict:
         et = e.get("type")
         if et == "decision":
             decision_count += 1
+            wrapper_enforced = "llm_result_raw" in e
             raw_result = e.get("llm_result_raw", e.get("llm_result"))
             clean_result = e.get("llm_result")
 
@@ -124,7 +126,7 @@ def analyze(path: Path, output_dir: Path) -> dict:
             accepted_relationship_proposals += len(rels) if isinstance(rels, dict) else 0
 
             for rej in e.get("rejected_relationship_changes", []) or []:
-                rejected_relationship_rows.append({
+                rejected_proposal_rows.append({
                     "game_time": e.get("game_time"),
                     "observer_id": e.get("entity_id"),
                     "observer_name": e.get("entity_name"),
@@ -147,14 +149,17 @@ def analyze(path: Path, output_dir: Path) -> dict:
                 target_id = str(ch.get("target_id"))
                 observer_id = str(e.get("entity_id"))
 
+                # New logs have already passed runtime schema enforcement. For
+                # legacy logs only, perform a conservative post-hoc validity check.
                 invalid_reason = None
-                if target_id == observer_id:
-                    invalid_reason = "self_target"
-                elif known_ids and target_id not in known_ids:
-                    invalid_reason = "unknown_target"
+                if not wrapper_enforced:
+                    if target_id == observer_id:
+                        invalid_reason = "self_target"
+                    elif known_ids and target_id not in known_ids:
+                        invalid_reason = "unknown_target"
 
                 if invalid_reason:
-                    rejected_relationship_rows.append({
+                    invalid_applied_rows.append({
                         "game_time": e.get("game_time"),
                         "observer_id": observer_id,
                         "observer_name": e.get("entity_name"),
@@ -219,10 +224,17 @@ def analyze(path: Path, output_dir: Path) -> dict:
         valid_decision_count / decision_count if decision_count else None
     )
     baseline_clean = len(interventions) == 0
-    schema_clean = len(rejected_relationship_rows) == 0
+    schema_output_clean = len(rejected_proposal_rows) == 0
+    state_schema_clean = len(invalid_applied_rows) == 0
+    proposal_accounting_delta = (
+        proposed_relationship_updates
+        - accepted_relationship_proposals
+        - len(rejected_proposal_rows)
+    )
     behaviorally_interpretable = bool(
         baseline_clean
-        and schema_clean
+        and state_schema_clean
+        and proposal_accounting_delta == 0
         and decision_count > 0
         and decision_success_rate is not None
         and decision_success_rate >= 0.95
@@ -239,12 +251,19 @@ def analyze(path: Path, output_dir: Path) -> dict:
         w.writeheader()
         w.writerows(trajectory_rows)
 
-    rejected_path = output_dir / "rejected_relationship_updates.csv"
+    rejected_path = output_dir / "rejected_relationship_proposals.csv"
     with rejected_path.open("w", encoding="utf-8", newline="") as f:
         fields = ["game_time", "observer_id", "observer_name", "target_id", "delta", "reason"]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        w.writerows(rejected_relationship_rows)
+        w.writerows(rejected_proposal_rows)
+
+    invalid_applied_path = output_dir / "invalid_applied_relationship_updates.csv"
+    with invalid_applied_path.open("w", encoding="utf-8", newline="") as f:
+        fields = ["game_time", "observer_id", "observer_name", "target_id", "delta", "reason"]
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(invalid_applied_rows)
 
     labels_path = output_dir / "label_events.csv"
     with labels_path.open("w", encoding="utf-8", newline="") as f:
@@ -283,8 +302,11 @@ def analyze(path: Path, output_dir: Path) -> dict:
         "total_memory_updates": total_memory_updates,
         "proposed_relationship_update_count": proposed_relationship_updates,
         "accepted_relationship_proposal_count": accepted_relationship_proposals,
-        "rejected_or_invalid_relationship_update_count": len(rejected_relationship_rows),
-        "schema_clean": schema_clean,
+        "rejected_relationship_proposal_count": len(rejected_proposal_rows),
+        "relationship_proposal_accounting_delta": proposal_accounting_delta,
+        "schema_output_clean": schema_output_clean,
+        "invalid_relationship_state_update_count": len(invalid_applied_rows),
+        "state_schema_clean": state_schema_clean,
         "action_counts": dict(action_counts),
         "mood_counts": dict(mood_counts),
         "relationship_update_count": len(trajectory_rows),
@@ -292,16 +314,20 @@ def analyze(path: Path, output_dir: Path) -> dict:
         "initial_positive_relationship_count": class_counts["initial_positive"],
         "initial_negative_relationship_count": class_counts["initial_negative"],
         "recurrent_amplification_count": recurrent_amp,
+        "recurrent_positive_amplification_count": class_counts["amplification_positive"],
+        "recurrent_negative_amplification_count": class_counts["amplification_negative"],
         "correction_toward_neutral_count": corr,
+        "sign_reversal_count": class_counts["sign_reversal"],
         "R_emp_correction_to_recurrent_amplification_ratio": r_emp,
         "label_memory_update_count": len(label_memory_updates),
         "label_speech_count": len(label_speeches),
         "external_intervention_count": len(interventions),
         "baseline_clean": baseline_clean,
         "interpretation_note": (
-            "Initial 0->nonzero relationship assignments are not counted as recursive amplification. "
-            "R_emp uses only recurrent amplification and correction events. Behavioral interpretation "
-            "requires >=95% valid decisions, no external interventions, and no invalid/self relationship targets."
+            "Initial 0->nonzero relationship assignments are not recursive amplification. "
+            "Rejected relationship proposals are schema-output errors but do not invalidate behavior "
+            "when the wrapper blocked them before state mutation. R_emp uses only recurrent valid "
+            "amplification and correction events and is not a validated RCA/WCT parameter."
         ),
     }
 
