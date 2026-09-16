@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Analyze JSONL logs produced by run_recursive_drift.py.
 
-The metrics here are intentionally descriptive. In particular, R_emp is a
-count-based correction/amplification diagnostic and is not asserted to be the
-same object as any theoretical RCA/WCT stabilization ratio.
+Metrics are descriptive. Initial relationship assignment is separated from
+recurrent amplification, and malformed/self targets are excluded from the
+scientific trajectory summary.
 """
 
 from __future__ import annotations
@@ -11,15 +11,27 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "research_logs"
-LABEL_TERMS = (
-    "danger", "dangerous", "threat", "hostile", "enemy", "suspicious",
-    "untrust", "attack", "kill", "fear", "deceiv", "lie", "betray",
-)
+
+LABEL_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\bdanger(?:ous)?\b",
+    r"\bthreat(?:s|ened|ening)?\b",
+    r"\bhostile\b",
+    r"\benemy|enemies\b",
+    r"\bsuspicious\b",
+    r"\buntrust(?:ed|worthy|ing)?\b",
+    r"\battack(?:s|ed|ing)?\b",
+    r"\bkill(?:s|ed|ing)?\b",
+    r"\bfear(?:s|ed|ful)?\b",
+    r"\bdeceiv(?:e|es|ed|ing)?\b",
+    r"\b(?:lie|lies|lied|lying)\b",
+    r"\bbetray(?:s|ed|ing|al)?\b",
+))
 
 
 def latest_log() -> Path:
@@ -30,16 +42,27 @@ def latest_log() -> Path:
 
 
 def contains_label(text: str) -> bool:
-    s = (text or "").lower()
-    return any(term in s for term in LABEL_TERMS)
+    s = text or ""
+    return any(p.search(s) for p in LABEL_PATTERNS)
 
 
-def classify_relationship(before: float, after: float, eps: float = 1e-9) -> str:
+def classify_relationship(before: float, after: float, existed_before: bool,
+                          eps: float = 1e-9) -> str:
+    if not existed_before and abs(before) <= eps:
+        if after > eps:
+            return "initial_positive"
+        if after < -eps:
+            return "initial_negative"
+        return "lateral"
+
+    if before * after < -(eps * eps):
+        return "sign_reversal"
+
     ab, aa = abs(before), abs(after)
     if aa > ab + eps:
-        return "amplification"
+        return "amplification_positive" if after > 0 else "amplification_negative"
     if aa < ab - eps:
-        return "correction"
+        return "correction_toward_neutral"
     return "lateral"
 
 
@@ -53,7 +76,16 @@ def analyze(path: Path, output_dir: Path) -> dict:
                 events.append(json.loads(line))
 
     counts = Counter(e.get("type", "unknown") for e in events)
+
+    known_ids = set()
+    for e in events:
+        if e.get("type") == "run_start":
+            for ent in e.get("entities", []) or []:
+                if isinstance(ent, dict) and ent.get("id"):
+                    known_ids.add(str(ent["id"]))
+
     trajectory_rows = []
+    rejected_relationship_rows = []
     label_memory_updates = []
     label_speeches = []
     interventions = []
@@ -63,6 +95,7 @@ def analyze(path: Path, output_dir: Path) -> dict:
     failed_decision_count = 0
     total_memory_updates = 0
     proposed_relationship_updates = 0
+    accepted_relationship_proposals = 0
     action_counts = Counter()
     mood_counts = Counter()
 
@@ -70,20 +103,35 @@ def analyze(path: Path, output_dir: Path) -> dict:
         et = e.get("type")
         if et == "decision":
             decision_count += 1
-            raw_result = e.get("llm_result")
-            if raw_result is None:
+            raw_result = e.get("llm_result_raw", e.get("llm_result"))
+            clean_result = e.get("llm_result")
+
+            if clean_result is None:
                 failed_decision_count += 1
                 continue
 
             valid_decision_count += 1
-            result = raw_result if isinstance(raw_result, dict) else {}
+            result = clean_result if isinstance(clean_result, dict) else {}
+            raw_dict = raw_result if isinstance(raw_result, dict) else result
 
             mems = result.get("memory_updates", []) or []
             rels = result.get("relationship_changes", {}) or {}
+            raw_rels = raw_dict.get("relationship_changes", {}) or {}
             acts = result.get("actions", []) or []
 
             total_memory_updates += len(mems) if isinstance(mems, list) else 0
-            proposed_relationship_updates += len(rels) if isinstance(rels, dict) else 0
+            proposed_relationship_updates += len(raw_rels) if isinstance(raw_rels, dict) else 0
+            accepted_relationship_proposals += len(rels) if isinstance(rels, dict) else 0
+
+            for rej in e.get("rejected_relationship_changes", []) or []:
+                rejected_relationship_rows.append({
+                    "game_time": e.get("game_time"),
+                    "observer_id": e.get("entity_id"),
+                    "observer_name": e.get("entity_name"),
+                    "target_id": rej.get("target_id"),
+                    "delta": rej.get("delta"),
+                    "reason": rej.get("reason", "wrapper_rejected"),
+                })
 
             mood = result.get("mood")
             if mood:
@@ -94,19 +142,45 @@ def analyze(path: Path, output_dir: Path) -> dict:
                     if isinstance(action, dict):
                         action_counts[str(action.get("type", "unknown"))] += 1
 
+            before_relationships = ((e.get("before") or {}).get("relationships") or {})
             for ch in e.get("relationship_changes_applied", []) or []:
+                target_id = str(ch.get("target_id"))
+                observer_id = str(e.get("entity_id"))
+
+                invalid_reason = None
+                if target_id == observer_id:
+                    invalid_reason = "self_target"
+                elif known_ids and target_id not in known_ids:
+                    invalid_reason = "unknown_target"
+
+                if invalid_reason:
+                    rejected_relationship_rows.append({
+                        "game_time": e.get("game_time"),
+                        "observer_id": observer_id,
+                        "observer_name": e.get("entity_name"),
+                        "target_id": target_id,
+                        "delta": ch.get("delta"),
+                        "reason": invalid_reason,
+                    })
+                    continue
+
                 before = float(ch.get("before", 0.0))
                 after = float(ch.get("after", 0.0))
+                existed_before = bool(ch.get(
+                    "existed_before", target_id in before_relationships
+                ))
+                classification = classify_relationship(before, after, existed_before)
                 trajectory_rows.append({
                     "wall_time": e.get("wall_time"),
                     "game_time": e.get("game_time"),
-                    "observer_id": e.get("entity_id"),
+                    "observer_id": observer_id,
                     "observer_name": e.get("entity_name"),
-                    "target_id": ch.get("target_id"),
+                    "target_id": target_id,
                     "before": before,
                     "after": after,
                     "delta": float(ch.get("delta", after - before)),
-                    "classification": classify_relationship(before, after),
+                    "existed_before": existed_before,
+                    "classification": classification,
                 })
 
             for mem in mems if isinstance(mems, list) else []:
@@ -134,16 +208,21 @@ def analyze(path: Path, output_dir: Path) -> dict:
             interventions.append(e)
 
     class_counts = Counter(r["classification"] for r in trajectory_rows)
-    amp = class_counts["amplification"]
-    corr = class_counts["correction"]
-    r_emp = (corr / amp) if amp else None
+    recurrent_amp = (
+        class_counts["amplification_positive"]
+        + class_counts["amplification_negative"]
+    )
+    corr = class_counts["correction_toward_neutral"]
+    r_emp = (corr / recurrent_amp) if recurrent_amp else None
 
     decision_success_rate = (
         valid_decision_count / decision_count if decision_count else None
     )
     baseline_clean = len(interventions) == 0
+    schema_clean = len(rejected_relationship_rows) == 0
     behaviorally_interpretable = bool(
         baseline_clean
+        and schema_clean
         and decision_count > 0
         and decision_success_rate is not None
         and decision_success_rate >= 0.95
@@ -153,11 +232,19 @@ def analyze(path: Path, output_dir: Path) -> dict:
     with traj_path.open("w", encoding="utf-8", newline="") as f:
         fields = [
             "wall_time", "game_time", "observer_id", "observer_name",
-            "target_id", "before", "after", "delta", "classification",
+            "target_id", "before", "after", "delta", "existed_before",
+            "classification",
         ]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(trajectory_rows)
+
+    rejected_path = output_dir / "rejected_relationship_updates.csv"
+    with rejected_path.open("w", encoding="utf-8", newline="") as f:
+        fields = ["game_time", "observer_id", "observer_name", "target_id", "delta", "reason"]
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rejected_relationship_rows)
 
     labels_path = output_dir / "label_events.csv"
     with labels_path.open("w", encoding="utf-8", newline="") as f:
@@ -195,24 +282,32 @@ def analyze(path: Path, output_dir: Path) -> dict:
         "behaviorally_interpretable": behaviorally_interpretable,
         "total_memory_updates": total_memory_updates,
         "proposed_relationship_update_count": proposed_relationship_updates,
+        "accepted_relationship_proposal_count": accepted_relationship_proposals,
+        "rejected_or_invalid_relationship_update_count": len(rejected_relationship_rows),
+        "schema_clean": schema_clean,
         "action_counts": dict(action_counts),
         "mood_counts": dict(mood_counts),
         "relationship_update_count": len(trajectory_rows),
         "relationship_classification_counts": dict(class_counts),
-        "R_emp_correction_to_amplification_count_ratio": r_emp,
+        "initial_positive_relationship_count": class_counts["initial_positive"],
+        "initial_negative_relationship_count": class_counts["initial_negative"],
+        "recurrent_amplification_count": recurrent_amp,
+        "correction_toward_neutral_count": corr,
+        "R_emp_correction_to_recurrent_amplification_ratio": r_emp,
         "label_memory_update_count": len(label_memory_updates),
         "label_speech_count": len(label_speeches),
         "external_intervention_count": len(interventions),
         "baseline_clean": baseline_clean,
         "interpretation_note": (
-            "Behavioral interpretation requires a clean run and at least 95% valid LLM decisions. "
-            "R_emp is a descriptive count ratio: relationship updates moving toward neutral divided "
-            "by updates moving farther from neutral. It is not a validated RCA/WCT parameter."
+            "Initial 0->nonzero relationship assignments are not counted as recursive amplification. "
+            "R_emp uses only recurrent amplification and correction events. Behavioral interpretation "
+            "requires >=95% valid decisions, no external interventions, and no invalid/self relationship targets."
         ),
     }
 
-    summary_path = output_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
     return summary
 
 
