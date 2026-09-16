@@ -16,91 +16,83 @@ logger = logging.getLogger(__name__)
 
 _client = OpenAI(
     base_url=config.LLM_BASE_URL,
-    api_key="ollama",          # value is ignored by local servers but required by the SDK
+    api_key="ollama",
 )
 _semaphore = threading.Semaphore(config.MAX_LLM_CONCURRENT)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  System prompt (describes the NPC's role and expected JSON schema)
-# ─────────────────────────────────────────────────────────────────────────────
 NPC_SYSTEM_PROMPT = """You are the decision-making AI for an NPC in a real-time 2D RPG sandbox.
 Your role: given the NPC's internal state, surroundings, and recent events, decide what they
 should do next. Stay in character based on their goals, mood, and personality.
 
 IMPORTANT RULES:
-- Respond ONLY with a single valid JSON object — no prose, no markdown fences.
-- Keep speech/say actions concise (≤ 15 words).
-- Actions must use valid coordinates within the map (0–63 on each axis).
+- Respond ONLY with a single valid JSON object. No prose, markdown fences, or JSON comments.
+- Keep speech/say actions concise (15 words or fewer).
+- Actions must use valid coordinates within the map (0-63 on each axis).
 - Do not hallucinate entity IDs; only reference IDs present in the context.
 - Multiple actions are allowed but must not contradict each other.
-- Be creative and emergent — NPCs should feel alive and goal-driven.
+- Be creative and emergent; NPCs should feel alive and goal-driven.
 
 RESPONSE SCHEMA (all fields required):
 {
   "actions": [
-    // One or more of:
-    {"type":"move","to":{"x":NUM,"y":NUM},"priority":1},
-    {"type":"say","target":"npc_id_or_null","text":"...","priority":2},
+    {"type":"move","to":{"x":0,"y":0},"priority":1},
+    {"type":"say","target":null,"text":"...","priority":2},
     {"type":"attack","target":"npc_id","priority":1},
     {"type":"pick_up","item_id":"item_id","priority":2},
     {"type":"drop","item_id":"item_id","priority":3},
     {"type":"use","item_id":"item_id","priority":2},
     {"type":"give","item_id":"item_id","target":"npc_id","priority":2},
-    {"type":"wait","duration":NUM_GAME_MINUTES,"priority":5},
+    {"type":"wait","duration":5,"priority":5},
     {"type":"sleep","priority":3}
   ],
-  "mood": "calm|happy|sad|angry|fearful|curious|bored|excited|tired|hungry",
+  "mood": "calm",
   "memory_updates": ["short string describing notable events to remember"],
-  "long_term_goals": ["...updated list of long-term goals..."],
-  "short_term_goals": ["...updated list of short-term goals..."],
-  "relationship_changes": {"npc_id": DELTA_FLOAT},
+  "long_term_goals": ["updated long-term goal"],
+  "short_term_goals": ["updated short-term goal"],
+  "relationship_changes": {"npc_id": 0.0},
   "metadata": {"reasoning": "brief internal reasoning"}
 }
+
+Use only the action objects that are appropriate; the example above shows allowed shapes, not a requirement to emit every action.
+Mood must be one of: calm, happy, sad, angry, fearful, curious, bored, excited, tired, hungry.
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Scheduler system prompt (for high-level command translation)
-# ─────────────────────────────────────────────────────────────────────────────
 SCHEDULER_SYSTEM_PROMPT = """You are the world-director AI for an RPG sandbox simulation.
 Your job: translate high-level developer commands or world events into targeted messages
-for individual NPCs (injected into their next decision prompts).
+for individual NPCs injected into their next decision prompts.
 
-Respond ONLY with valid JSON. No prose, no markdown fences.
+Respond ONLY with a single valid JSON object. No prose, markdown fences, or JSON comments.
 
 RESPONSE SCHEMA:
 {
   "messages": [
-    {"npc_id": "npc_xxxxx", "message": "You should now ..."},
-    ...
+    {"npc_id": "npc_xxxxx", "message": "You should now ..."}
   ],
   "world_effects": [
-    // Optional direct world changes:
     {"type": "set_status", "npc_id": "npc_xxxxx", "status": "idle"},
     {"type": "set_health", "npc_id": "npc_xxxxx", "health": 50},
-    {"type": "set_mood",   "npc_id": "npc_xxxxx", "mood": "angry"},
-    {"type": "teleport",   "npc_id": "npc_xxxxx", "x": 10, "y": 10},
+    {"type": "set_mood", "npc_id": "npc_xxxxx", "mood": "angry"},
+    {"type": "teleport", "npc_id": "npc_xxxxx", "x": 10, "y": 10},
     {"type": "spawn_item", "name": "apple", "x": 20, "y": 20},
-    {"type": "log_event",  "text": "Something happened in the world"}
+    {"type": "log_event", "text": "Something happened in the world"}
   ],
   "reasoning": "brief explanation of decisions"
 }
+
+Use only the message and world-effect objects that are appropriate.
 """
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Prompt builder
-# ─────────────────────────────────────────────────────────────────────────────
 def build_npc_prompt(entity, world, injected_message: str = None) -> str:
     e = entity
     inventory_names = []
     for item_id in e.inventory:
         it = world.items.get(item_id)
-        if it: inventory_names.append(it.name)
+        if it:
+            inventory_names.append(it.name)
 
     perceptions = world.get_perceptions(e)
-
     recent_evts = [ev["text"] for ev in world.recent_events(30)][-8:]
-
     st_mems = [m["text"] for m in e.short_term_memories[-8:]]
     lt_mems = [m["text"] for m in e.memories[-200:] if m not in e.short_term_memories][-5:]
 
@@ -113,11 +105,16 @@ def build_npc_prompt(entity, world, injected_message: str = None) -> str:
         "world_time": world.clock_str(),
         "time_of_day": world.time_of_day(),
         "npc": {
-            "id": e.id, "name": e.name, "role": e.sprite_type,
+            "id": e.id,
+            "name": e.name,
+            "role": e.sprite_type,
             "position": {"x": round(e.position["x"], 1), "y": round(e.position["y"], 1)},
-            "health": round(e.health, 1), "max_health": round(e.max_health, 1),
-            "hunger": f"{e.hunger:.0%}", "energy": f"{e.energy:.0%}",
-            "mood": e.mood, "weapon": e.weapon_type,
+            "health": round(e.health, 1),
+            "max_health": round(e.max_health, 1),
+            "hunger": f"{e.hunger:.0%}",
+            "energy": f"{e.energy:.0%}",
+            "mood": e.mood,
+            "weapon": e.weapon_type,
             "inventory": inventory_names,
             "short_term_goals": e.short_term_goals,
             "long_term_goals": e.long_term_goals,
@@ -138,11 +135,15 @@ def build_npc_prompt(entity, world, injected_message: str = None) -> str:
 def build_scheduler_prompt(command: str, world) -> str:
     npc_summaries = []
     for e in world.entities.values():
-        if not e.is_alive(): continue
+        if not e.is_alive():
+            continue
         npc_summaries.append({
-            "id": e.id, "name": e.name, "role": e.sprite_type,
-            "pos": {"x": round(e.position["x"],1), "y": round(e.position["y"],1)},
-            "status": e.status, "mood": e.mood,
+            "id": e.id,
+            "name": e.name,
+            "role": e.sprite_type,
+            "pos": {"x": round(e.position["x"], 1), "y": round(e.position["y"], 1)},
+            "status": e.status,
+            "mood": e.mood,
             "goals": e.short_term_goals[:2],
         })
     context = {
@@ -153,24 +154,21 @@ def build_scheduler_prompt(command: str, world) -> str:
     return json.dumps(context, indent=2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Response parsing
-# ─────────────────────────────────────────────────────────────────────────────
 def _extract_json(text: str) -> Optional[dict]:
-    """Strip markdown fences and parse JSON, tolerating minor issues."""
+    """Parse a JSON object, retaining fence stripping as a compatibility fallback."""
     text = text.strip()
-    # Remove ```json ... ``` fences
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     text = text.strip()
     try:
-        return json.loads(text)
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
     except json.JSONDecodeError:
-        # Try to find first { ... } block
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m:
             try:
-                return json.loads(m.group())
+                data = json.loads(m.group())
+                return data if isinstance(data, dict) else None
             except Exception:
                 pass
     return None
@@ -191,6 +189,8 @@ def validate_npc_response(data: dict) -> dict:
         result["mood"] = "calm"
 
     for action in data.get("actions", []):
+        if not isinstance(action, dict):
+            continue
         atype = action.get("type")
         if atype not in config.VALID_ACTIONS:
             continue
@@ -205,43 +205,49 @@ def validate_npc_response(data: dict) -> dict:
                 }
             except (TypeError, ValueError):
                 continue
-
         elif atype == config.ACTION_SAY:
             clean["target"] = action.get("target")
-            clean["text"]   = str(action.get("text", ""))[:100]
-
+            clean["text"] = str(action.get("text", ""))[:100]
         elif atype == config.ACTION_ATTACK:
-            if not action.get("target"): continue
+            if not action.get("target"):
+                continue
             clean["target"] = action["target"]
-
         elif atype in (config.ACTION_PICK_UP, config.ACTION_USE, config.ACTION_DROP):
-            if not action.get("item_id"): continue
+            if not action.get("item_id"):
+                continue
             clean["item_id"] = action["item_id"]
-
         elif atype == config.ACTION_GIVE:
-            if not action.get("item_id") or not action.get("target"): continue
+            if not action.get("item_id") or not action.get("target"):
+                continue
             clean["item_id"] = action["item_id"]
-            clean["target"]  = action["target"]
-
+            clean["target"] = action["target"]
         elif atype == config.ACTION_WAIT:
             clean["duration"] = float(action.get("duration", 5))
 
         result["actions"].append(clean)
+
+    if not isinstance(result["memory_updates"], list):
+        result["memory_updates"] = []
+    if not isinstance(result["long_term_goals"], list):
+        result["long_term_goals"] = []
+    if not isinstance(result["short_term_goals"], list):
+        result["short_term_goals"] = []
+    if not isinstance(result["relationship_changes"], dict):
+        result["relationship_changes"] = {}
+    if not isinstance(result["metadata"], dict):
+        result["metadata"] = {}
 
     return result
 
 
 def validate_scheduler_response(data: dict) -> dict:
     return {
-        "messages":      data.get("messages", []),
+        "messages": data.get("messages", []),
         "world_effects": data.get("world_effects", []),
-        "reasoning":     data.get("reasoning", ""),
+        "reasoning": data.get("reasoning", ""),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Async LLM call wrappers
-# ─────────────────────────────────────────────────────────────────────────────
 def call_npc_llm_async(entity, world, injected_message: str = None,
                        callback: Callable = None):
     """Fire an async LLM call for an NPC decision. callback(entity_id, result_dict | None)."""
@@ -255,9 +261,10 @@ def call_npc_llm_async(entity, world, injected_message: str = None,
                 resp = _client.chat.completions.create(
                     model=config.LLM_MODEL,
                     max_tokens=config.LLM_MAX_TOKENS,
+                    response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": NPC_SYSTEM_PROMPT},
-                        {"role": "user",   "content": prompt},
+                        {"role": "user", "content": prompt},
                     ],
                 )
                 raw = resp.choices[0].message.content or ""
@@ -267,11 +274,15 @@ def call_npc_llm_async(entity, world, injected_message: str = None,
                     if callback:
                         callback(eid, validated)
                 else:
-                    logger.warning(f"NPC {eid}: could not parse LLM response:\n{raw[:300]}")
+                    finish = getattr(resp.choices[0], "finish_reason", None)
+                    logger.warning(
+                        f"NPC {eid}: could not parse JSON response "
+                        f"(finish_reason={finish}, chars={len(raw)}):\n{raw[:500]}"
+                    )
                     if callback:
                         callback(eid, None)
             except Exception as ex:
-                logger.error(f"LLM call failed for {eid}: {ex}")
+                logger.error(f"LLM call failed for {eid}: {type(ex).__name__}: {ex}")
                 if callback:
                     callback(eid, None)
 
@@ -290,9 +301,10 @@ def call_scheduler_llm_async(command: str, world,
                 resp = _client.chat.completions.create(
                     model=config.LLM_MODEL,
                     max_tokens=config.LLM_MAX_TOKENS,
+                    response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": SCHEDULER_SYSTEM_PROMPT},
-                        {"role": "user",   "content": prompt},
+                        {"role": "user", "content": prompt},
                     ],
                 )
                 raw = resp.choices[0].message.content or ""
@@ -302,11 +314,15 @@ def call_scheduler_llm_async(command: str, world,
                     if callback:
                         callback(validated)
                 else:
-                    logger.warning(f"Scheduler: could not parse response:\n{raw[:300]}")
+                    finish = getattr(resp.choices[0], "finish_reason", None)
+                    logger.warning(
+                        f"Scheduler: could not parse JSON response "
+                        f"(finish_reason={finish}, chars={len(raw)}):\n{raw[:500]}"
+                    )
                     if callback:
                         callback(None)
             except Exception as ex:
-                logger.error(f"Scheduler LLM call failed: {ex}")
+                logger.error(f"Scheduler LLM call failed: {type(ex).__name__}: {ex}")
                 if callback:
                     callback(None)
 
