@@ -58,9 +58,42 @@ def analyze(path: Path, output_dir: Path) -> dict:
     label_speeches = []
     interventions = []
 
+    decision_count = 0
+    valid_decision_count = 0
+    failed_decision_count = 0
+    total_memory_updates = 0
+    proposed_relationship_updates = 0
+    action_counts = Counter()
+    mood_counts = Counter()
+
     for e in events:
         et = e.get("type")
         if et == "decision":
+            decision_count += 1
+            raw_result = e.get("llm_result")
+            if raw_result is None:
+                failed_decision_count += 1
+                continue
+
+            valid_decision_count += 1
+            result = raw_result if isinstance(raw_result, dict) else {}
+
+            mems = result.get("memory_updates", []) or []
+            rels = result.get("relationship_changes", {}) or {}
+            acts = result.get("actions", []) or []
+
+            total_memory_updates += len(mems) if isinstance(mems, list) else 0
+            proposed_relationship_updates += len(rels) if isinstance(rels, dict) else 0
+
+            mood = result.get("mood")
+            if mood:
+                mood_counts[str(mood)] += 1
+
+            if isinstance(acts, list):
+                for action in acts:
+                    if isinstance(action, dict):
+                        action_counts[str(action.get("type", "unknown"))] += 1
+
             for ch in e.get("relationship_changes_applied", []) or []:
                 before = float(ch.get("before", 0.0))
                 after = float(ch.get("after", 0.0))
@@ -76,8 +109,7 @@ def analyze(path: Path, output_dir: Path) -> dict:
                     "classification": classify_relationship(before, after),
                 })
 
-            result = e.get("llm_result") or {}
-            for mem in result.get("memory_updates", []) or []:
+            for mem in mems if isinstance(mems, list) else []:
                 if contains_label(str(mem)):
                     label_memory_updates.append({
                         "game_time": e.get("game_time"),
@@ -105,6 +137,17 @@ def analyze(path: Path, output_dir: Path) -> dict:
     amp = class_counts["amplification"]
     corr = class_counts["correction"]
     r_emp = (corr / amp) if amp else None
+
+    decision_success_rate = (
+        valid_decision_count / decision_count if decision_count else None
+    )
+    baseline_clean = len(interventions) == 0
+    behaviorally_interpretable = bool(
+        baseline_clean
+        and decision_count > 0
+        and decision_success_rate is not None
+        and decision_success_rate >= 0.95
+    )
 
     traj_path = output_dir / "relationship_trajectory.csv"
     with traj_path.open("w", encoding="utf-8", newline="") as f:
@@ -145,16 +188,26 @@ def analyze(path: Path, output_dir: Path) -> dict:
     summary = {
         "source_log": str(path),
         "event_counts": dict(counts),
+        "decision_count": decision_count,
+        "valid_decision_count": valid_decision_count,
+        "failed_decision_count": failed_decision_count,
+        "decision_success_rate": decision_success_rate,
+        "behaviorally_interpretable": behaviorally_interpretable,
+        "total_memory_updates": total_memory_updates,
+        "proposed_relationship_update_count": proposed_relationship_updates,
+        "action_counts": dict(action_counts),
+        "mood_counts": dict(mood_counts),
         "relationship_update_count": len(trajectory_rows),
         "relationship_classification_counts": dict(class_counts),
         "R_emp_correction_to_amplification_count_ratio": r_emp,
         "label_memory_update_count": len(label_memory_updates),
         "label_speech_count": len(label_speeches),
         "external_intervention_count": len(interventions),
-        "baseline_clean": len(interventions) == 0,
+        "baseline_clean": baseline_clean,
         "interpretation_note": (
-            "R_emp is a descriptive count ratio: relationship updates moving toward neutral "
-            "divided by updates moving farther from neutral. It is not a validated RCA/WCT parameter."
+            "Behavioral interpretation requires a clean run and at least 95% valid LLM decisions. "
+            "R_emp is a descriptive count ratio: relationship updates moving toward neutral divided "
+            "by updates moving farther from neutral. It is not a validated RCA/WCT parameter."
         ),
     }
 
