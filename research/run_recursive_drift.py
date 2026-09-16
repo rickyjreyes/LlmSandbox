@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Run LlmSandbox with non-invasive recursive-drift instrumentation.
 
-This wrapper monkey-patches Scheduler at runtime instead of modifying the base
-simulation logic. It records decision-level state changes, speech propagation,
-relationship changes, and external interventions to JSONL for later analysis.
+The base simulator remains unchanged. This wrapper records decision-level state
+and enforces the simulator's declared relationship schema during research runs:
+relationship_changes may only target another NPC that actually exists.
 """
 
 from __future__ import annotations
 
+import copy
 import json
-import os
 import sys
 import threading
 import time
@@ -22,7 +22,6 @@ if str(ROOT) not in sys.path:
 
 import config
 import scheduler as scheduler_module
-
 
 LOG_DIR = ROOT / "research_logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -68,8 +67,53 @@ def _relationship_diff(before: dict, after: dict) -> list[dict]:
                 "delta": a - b,
                 "abs_before": abs(b),
                 "abs_after": abs(a),
+                "existed_before": target_id in before,
+                "exists_after": target_id in after,
             })
     return out
+
+
+def _sanitize_relationship_changes(world, entity_id: str, result):
+    """Reject self, nonexistent, and nonnumeric relationship targets.
+
+    This is schema enforcement, not a behavioral intervention: the base prompt
+    already requires relationship_changes keys to be valid NPC IDs.
+    """
+    if not isinstance(result, dict):
+        return result, []
+
+    clean_result = copy.deepcopy(result)
+    rels = clean_result.get("relationship_changes", {})
+    if not isinstance(rels, dict):
+        clean_result["relationship_changes"] = {}
+        return clean_result, []
+
+    accepted = {}
+    rejected = []
+    for target_id, delta in rels.items():
+        target_id = str(target_id)
+        reason = None
+        if target_id == entity_id:
+            reason = "self_target"
+        elif target_id not in world.entities:
+            reason = "unknown_target"
+        else:
+            try:
+                delta = float(delta)
+            except (TypeError, ValueError):
+                reason = "nonnumeric_delta"
+
+        if reason:
+            rejected.append({
+                "target_id": target_id,
+                "delta": delta,
+                "reason": reason,
+            })
+        else:
+            accepted[target_id] = delta
+
+    clean_result["relationship_changes"] = accepted
+    return clean_result, rejected
 
 
 _ORIG_INIT = scheduler_module.Scheduler.__init__
@@ -93,10 +137,16 @@ def _instrumented_init(self, world):
 def _instrumented_response(self, entity_id, result):
     e = self.world.entities.get(entity_id)
     before = _snapshot(e) if e else None
-    _ORIG_RESPONSE(self, entity_id, result)
+
+    raw_result = copy.deepcopy(result) if isinstance(result, dict) else result
+    clean_result, rejected_relationships = _sanitize_relationship_changes(
+        self.world, entity_id, result
+    )
+
+    _ORIG_RESPONSE(self, entity_id, clean_result)
+
     e2 = self.world.entities.get(entity_id)
     after = _snapshot(e2) if e2 else None
-
     event = {
         "type": "decision",
         "game_time": getattr(self.world, "game_time", None),
@@ -105,7 +155,9 @@ def _instrumented_response(self, entity_id, result):
         "model": getattr(config, "LLM_MODEL", None),
         "before": before,
         "after": after,
-        "llm_result": result,
+        "llm_result": clean_result,
+        "llm_result_raw": raw_result,
+        "rejected_relationship_changes": rejected_relationships,
         "external_directive_present": bool(
             getattr(e2 or e, "pending_scheduler_message", None)
         ) if (e2 or e) else False,
@@ -114,9 +166,8 @@ def _instrumented_response(self, entity_id, result):
         event["relationship_changes_applied"] = _relationship_diff(
             before.get("relationships", {}), after.get("relationships", {})
         )
-        event["new_memories"] = after["recent_memories"][
-            max(0, len(after["recent_memories"]) - max(0, after["memory_count"] - before["memory_count"])):
-        ] if after["memory_count"] > before["memory_count"] else []
+        added = max(0, after["memory_count"] - before["memory_count"])
+        event["new_memories"] = after["recent_memories"][-added:] if added else []
     _write(event)
 
 
@@ -188,10 +239,12 @@ if __name__ == "__main__":
         "type": "instrumentation",
         "log_path": str(LOG_PATH),
         "argv": sys.argv,
-        "note": "Base simulator code is unmodified; instrumentation is wrapper-only.",
+        "note": (
+            "Base simulator code is unmodified; research wrapper logs state and "
+            "enforces declared relationship target IDs."
+        ),
     })
     print(f"[research] recursive-drift log: {LOG_PATH}")
 
     import main as sandbox_main
-
     sandbox_main.main()
