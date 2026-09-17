@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Run LlmSandbox with non-invasive recursive-drift instrumentation.
+"""Run LlmSandbox with non-invasive recursive-drift instrumentation and ablations.
 
-The base simulator remains unchanged. This wrapper records decision-level state
-and enforces the simulator's declared relationship schema during research runs:
-relationship_changes may only target another NPC that actually exists.
+The base simulator remains unchanged. This wrapper records decision-level state,
+enforces declared relationship target IDs, and can selectively remove feedback
+channels or apply an explicit restoring gain for matched causal experiments.
 """
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
+import random
+import re
+import shutil
 import sys
 import threading
 import time
@@ -21,13 +25,86 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import config
+import llm as llm_module
 import scheduler as scheduler_module
+
+
+def _parse_args():
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("--run-label", default="baseline")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--world-template", type=Path, default=None)
+    p.add_argument("--max-decisions", type=int, default=None,
+                   help="Automatically close after this many valid LLM decisions")
+    p.add_argument("--memory-feedback", choices=("on", "off"), default="on")
+    p.add_argument("--communication", choices=("on", "off"), default="on")
+    p.add_argument("--relationship-feedback", choices=("on", "off"), default="on")
+    p.add_argument("--correction-gain", type=float, default=0.0,
+                   help="Per-decision damping r <- (1-gamma) r; 0 <= gamma <= 1")
+    p.add_argument("--periodic-check", type=float, default=None)
+    p.add_argument("--perception-radius", type=float, default=None)
+    p.add_argument("--short-term-mem-limit", type=int, default=None)
+    p.add_argument("--model", default=None)
+    args, _unknown = p.parse_known_args()
+    if not 0.0 <= args.correction_gain <= 1.0:
+        p.error("--correction-gain must be between 0 and 1")
+    if args.max_decisions is not None and args.max_decisions <= 0:
+        p.error("--max-decisions must be > 0")
+    return args
+
+
+EXP = _parse_args()
+STAMP = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+SAFE_LABEL = re.sub(r"[^A-Za-z0-9_.-]+", "_", EXP.run_label).strip("_") or "run"
+
+# Apply explicit research overrides before the simulator starts.
+if EXP.seed is not None:
+    random.seed(EXP.seed)
+if EXP.periodic_check is not None:
+    config.PERIODIC_CHECK_INTERVAL = EXP.periodic_check
+if EXP.perception_radius is not None:
+    config.PERCEPTION_RADIUS = EXP.perception_radius
+if EXP.short_term_mem_limit is not None:
+    config.SHORT_TERM_MEM_LIMIT = EXP.short_term_mem_limit
+if EXP.model:
+    config.LLM_MODEL = EXP.model
+
+# An immutable template is copied to a run-local save so the simulator's normal
+# autosave/exit-save behavior cannot mutate the matched starting condition.
+RUNTIME_WORLD = None
+if EXP.world_template is not None:
+    template = EXP.world_template.resolve()
+    if not template.exists():
+        raise FileNotFoundError(f"World template not found: {template}")
+    runtime_dir = ROOT / "research_runtime" / f"{STAMP}_{SAFE_LABEL}"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    RUNTIME_WORLD = runtime_dir / "world_save.json"
+    shutil.copy2(template, RUNTIME_WORLD)
+    config.SAVE_FILE = str(RUNTIME_WORLD)
 
 LOG_DIR = ROOT / "research_logs"
 LOG_DIR.mkdir(exist_ok=True)
-STAMP = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-LOG_PATH = LOG_DIR / f"recursive_drift_{STAMP}.jsonl"
+LOG_PATH = LOG_DIR / f"recursive_drift_{STAMP}_{SAFE_LABEL}.jsonl"
 _LOCK = threading.Lock()
+_VALID_DECISIONS = 0
+
+
+def _experiment_metadata() -> dict:
+    return {
+        "run_label": EXP.run_label,
+        "seed": EXP.seed,
+        "world_template": str(EXP.world_template) if EXP.world_template else None,
+        "runtime_world": str(RUNTIME_WORLD) if RUNTIME_WORLD else None,
+        "max_decisions": EXP.max_decisions,
+        "memory_feedback": EXP.memory_feedback,
+        "communication": EXP.communication,
+        "relationship_feedback": EXP.relationship_feedback,
+        "correction_gain": EXP.correction_gain,
+        "periodic_check_interval": config.PERIODIC_CHECK_INTERVAL,
+        "perception_radius": config.PERCEPTION_RADIUS,
+        "short_term_mem_limit": config.SHORT_TERM_MEM_LIMIT,
+        "model": getattr(config, "LLM_MODEL", None),
+    }
 
 
 def _write(event: dict) -> None:
@@ -74,11 +151,7 @@ def _relationship_diff(before: dict, after: dict) -> list[dict]:
 
 
 def _sanitize_relationship_changes(world, entity_id: str, result):
-    """Reject self, nonexistent, and nonnumeric relationship targets.
-
-    This is schema enforcement, not a behavioral intervention: the base prompt
-    already requires relationship_changes keys to be valid NPC IDs.
-    """
+    """Reject self, nonexistent, and nonnumeric relationship targets."""
     if not isinstance(result, dict):
         return result, []
 
@@ -104,16 +177,42 @@ def _sanitize_relationship_changes(world, entity_id: str, result):
                 reason = "nonnumeric_delta"
 
         if reason:
-            rejected.append({
-                "target_id": target_id,
-                "delta": delta,
-                "reason": reason,
-            })
+            rejected.append({"target_id": target_id, "delta": delta, "reason": reason})
         else:
             accepted[target_id] = delta
 
     clean_result["relationship_changes"] = accepted
     return clean_result, rejected
+
+
+def _post_quit_event() -> None:
+    try:
+        import pygame
+        pygame.event.post(pygame.event.Event(pygame.QUIT))
+    except Exception as ex:
+        _write({"type": "research_warning", "warning": f"auto-stop failed: {ex}"})
+
+
+# Prompt-level ablations. They hide a feedback channel from the next LLM prompt
+# while leaving the underlying simulator state available for instrumentation.
+_ORIG_BUILD_NPC_PROMPT = llm_module.build_npc_prompt
+
+
+def _instrumented_build_npc_prompt(entity, world, injected_message: str = None):
+    saved_memories = entity.memories
+    saved_short_memories = entity.short_term_memories
+    saved_relationships = entity.relationships
+    try:
+        if EXP.memory_feedback == "off":
+            entity.memories = []
+            entity.short_term_memories = []
+        if EXP.relationship_feedback == "off":
+            entity.relationships = {}
+        return _ORIG_BUILD_NPC_PROMPT(entity, world, injected_message)
+    finally:
+        entity.memories = saved_memories
+        entity.short_term_memories = saved_short_memories
+        entity.relationships = saved_relationships
 
 
 _ORIG_INIT = scheduler_module.Scheduler.__init__
@@ -130,11 +229,15 @@ def _instrumented_init(self, world):
         "game_time": getattr(world, "game_time", 0.0),
         "model": getattr(config, "LLM_MODEL", None),
         "npc_count": len(world.entities),
+        "world_seed": getattr(world, "seed", None),
+        "experiment": _experiment_metadata(),
         "entities": [_snapshot(e) for e in world.entities.values()],
     })
 
 
 def _instrumented_response(self, entity_id, result):
+    global _VALID_DECISIONS
+
     e = self.world.entities.get(entity_id)
     before = _snapshot(e) if e else None
 
@@ -146,6 +249,29 @@ def _instrumented_response(self, entity_id, result):
     _ORIG_RESPONSE(self, entity_id, clean_result)
 
     e2 = self.world.entities.get(entity_id)
+    post_llm_relationships = dict(e2.relationships) if e2 else {}
+    correction_changes = []
+
+    # Explicit experimental restoring term. gamma=0 is exactly the baseline.
+    # For gamma>0, every currently stored relationship is damped toward neutral
+    # after the native LLM update: r_final = (1-gamma) * r_native.
+    if e2 and EXP.correction_gain > 0.0:
+        gamma = EXP.correction_gain
+        for target_id, value in list(e2.relationships.items()):
+            native = float(value)
+            final = (1.0 - gamma) * native
+            if abs(final) < 1e-12:
+                final = 0.0
+            if abs(final - native) > 1e-12:
+                e2.relationships[target_id] = final
+                correction_changes.append({
+                    "target_id": target_id,
+                    "native_after": native,
+                    "final_after": final,
+                    "treatment_delta": final - native,
+                    "gamma": gamma,
+                })
+
     after = _snapshot(e2) if e2 else None
     event = {
         "type": "decision",
@@ -153,8 +279,11 @@ def _instrumented_response(self, entity_id, result):
         "entity_id": entity_id,
         "entity_name": e2.name if e2 else (e.name if e else None),
         "model": getattr(config, "LLM_MODEL", None),
+        "experiment": _experiment_metadata(),
         "before": before,
         "after": after,
+        "post_llm_relationships_before_correction": post_llm_relationships,
+        "correction_treatment_changes": correction_changes,
         "llm_result": clean_result,
         "llm_result_raw": raw_result,
         "rejected_relationship_changes": rejected_relationships,
@@ -170,14 +299,34 @@ def _instrumented_response(self, entity_id, result):
         event["new_memories"] = after["recent_memories"][-added:] if added else []
     _write(event)
 
+    if clean_result is not None:
+        _VALID_DECISIONS += 1
+        if EXP.max_decisions is not None and _VALID_DECISIONS >= EXP.max_decisions:
+            _write({
+                "type": "auto_stop",
+                "game_time": getattr(self.world, "game_time", None),
+                "valid_decisions": _VALID_DECISIONS,
+                "reason": "max_decisions_reached",
+            })
+            _post_quit_event()
+
 
 def _instrumented_execute(self, e, action):
     atype = action.get("type") if isinstance(action, dict) else None
     target_id = action.get("target") if isinstance(action, dict) else None
     target = self.world.entities.get(target_id) if target_id else None
     target_mem_before = len(target.memories) if target else None
+    communication_blocked = False
 
-    _ORIG_EXECUTE(self, e, action)
+    if atype == getattr(config, "ACTION_SAY", "say") and EXP.communication == "off":
+        # Preserve the source agent's visible speech action but do not place the
+        # utterance in the world event stream or the target's memory. This
+        # removes the explicit agent-to-agent text propagation pathway.
+        text = action.get("text", "")
+        e.say(text, time.time())
+        communication_blocked = True
+    else:
+        _ORIG_EXECUTE(self, e, action)
 
     if atype == getattr(config, "ACTION_SAY", "say"):
         _write({
@@ -188,6 +337,7 @@ def _instrumented_execute(self, e, action):
             "target_id": target_id,
             "target_name": target.name if target else None,
             "text": action.get("text", ""),
+            "communication_blocked": communication_blocked,
             "target_memory_added": (
                 len(target.memories) > target_mem_before
                 if target is not None and target_mem_before is not None else False
@@ -226,6 +376,7 @@ def _instrumented_interrupt(self, entity_id, message):
 
 
 def install_instrumentation() -> None:
+    llm_module.build_npc_prompt = _instrumented_build_npc_prompt
     scheduler_module.Scheduler.__init__ = _instrumented_init
     scheduler_module.Scheduler._on_npc_response = _instrumented_response
     scheduler_module.Scheduler._execute_action = _instrumented_execute
@@ -239,12 +390,15 @@ if __name__ == "__main__":
         "type": "instrumentation",
         "log_path": str(LOG_PATH),
         "argv": sys.argv,
+        "experiment": _experiment_metadata(),
         "note": (
-            "Base simulator code is unmodified; research wrapper logs state and "
-            "enforces declared relationship target IDs."
+            "Base simulator files are unmodified. Research wrapper logs state, "
+            "enforces relationship target IDs, and applies only explicitly selected "
+            "experimental feedback ablations/treatments."
         ),
     })
     print(f"[research] recursive-drift log: {LOG_PATH}")
+    print("[research] experiment:", json.dumps(_experiment_metadata(), sort_keys=True))
 
     import main as sandbox_main
     sandbox_main.main()
