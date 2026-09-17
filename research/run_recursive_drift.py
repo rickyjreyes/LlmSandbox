@@ -2,8 +2,9 @@
 """Run LlmSandbox with non-invasive recursive-drift instrumentation and ablations.
 
 The base simulator remains unchanged. This wrapper records decision-level state,
-enforces declared relationship target IDs, and can selectively remove feedback
-channels or apply an explicit restoring gain for matched causal experiments.
+enforces declared relationship target IDs, hardens research-run schema validation,
+and can selectively remove feedback channels or apply an explicit restoring gain
+for matched causal experiments.
 """
 
 from __future__ import annotations
@@ -36,6 +37,8 @@ def _parse_args():
     p.add_argument("--world-template", type=Path, default=None)
     p.add_argument("--max-decisions", type=int, default=None,
                    help="Automatically close after this many valid LLM decisions")
+    p.add_argument("--max-failed-decisions", type=int, default=10,
+                   help="Abort a research run after this many invalid/failed LLM decisions")
     p.add_argument("--memory-feedback", choices=("on", "off"), default="on")
     p.add_argument("--communication", choices=("on", "off"), default="on")
     p.add_argument("--relationship-feedback", choices=("on", "off"), default="on")
@@ -50,6 +53,8 @@ def _parse_args():
         p.error("--correction-gain must be between 0 and 1")
     if args.max_decisions is not None and args.max_decisions <= 0:
         p.error("--max-decisions must be > 0")
+    if args.max_failed_decisions < 0:
+        p.error("--max-failed-decisions must be >= 0")
     return args
 
 
@@ -87,6 +92,8 @@ LOG_DIR.mkdir(exist_ok=True)
 LOG_PATH = LOG_DIR / f"recursive_drift_{STAMP}_{SAFE_LABEL}.jsonl"
 _LOCK = threading.Lock()
 _VALID_DECISIONS = 0
+_FAILED_DECISIONS = 0
+_SCHEMA_NORMALIZATIONS = 0
 
 
 def _experiment_metadata() -> dict:
@@ -96,6 +103,7 @@ def _experiment_metadata() -> dict:
         "world_template": str(EXP.world_template) if EXP.world_template else None,
         "runtime_world": str(RUNTIME_WORLD) if RUNTIME_WORLD else None,
         "max_decisions": EXP.max_decisions,
+        "max_failed_decisions": EXP.max_failed_decisions,
         "memory_feedback": EXP.memory_feedback,
         "communication": EXP.communication,
         "relationship_feedback": EXP.relationship_feedback,
@@ -193,6 +201,102 @@ def _post_quit_event() -> None:
         _write({"type": "research_warning", "warning": f"auto-stop failed: {ex}"})
 
 
+# Research-side schema hardening. The upstream validator assumes action fields
+# such as priority/duration/target IDs already have scalar JSON types. Local LLMs
+# occasionally return valid JSON with the wrong type (for example priority=[1]).
+# Normalize or drop only schema-invalid action fields before calling the original
+# validator so malformed output cannot crash an experimental condition.
+_ORIG_VALIDATE_NPC_RESPONSE = llm_module.validate_npc_response
+
+
+def _safe_int(value, default: int) -> int:
+    if isinstance(value, bool) or isinstance(value, (list, dict, tuple, set)):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_float(value, default: float) -> float:
+    if isinstance(value, bool) or isinstance(value, (list, dict, tuple, set)):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _research_validate_npc_response(data: dict) -> dict:
+    global _SCHEMA_NORMALIZATIONS
+
+    if not isinstance(data, dict):
+        data = {}
+
+    clean = copy.deepcopy(data)
+    raw_actions = clean.get("actions", [])
+    if not isinstance(raw_actions, list):
+        raw_actions = []
+        _SCHEMA_NORMALIZATIONS += 1
+
+    normalized_actions = []
+    for action in raw_actions:
+        if not isinstance(action, dict):
+            _SCHEMA_NORMALIZATIONS += 1
+            continue
+
+        a = dict(action)
+        atype = a.get("type")
+        if not isinstance(atype, str) or atype not in config.VALID_ACTIONS:
+            _SCHEMA_NORMALIZATIONS += 1
+            continue
+
+        original_priority = a.get("priority", 5)
+        normalized_priority = _safe_int(original_priority, 5)
+        if normalized_priority != original_priority:
+            _SCHEMA_NORMALIZATIONS += 1
+        a["priority"] = normalized_priority
+
+        if atype == config.ACTION_MOVE:
+            if not isinstance(a.get("to"), dict):
+                _SCHEMA_NORMALIZATIONS += 1
+                continue
+
+        elif atype == config.ACTION_SAY:
+            target = a.get("target")
+            if target is not None and not isinstance(target, str):
+                a["target"] = None
+                _SCHEMA_NORMALIZATIONS += 1
+
+        elif atype == config.ACTION_ATTACK:
+            if not isinstance(a.get("target"), str) or not a.get("target"):
+                _SCHEMA_NORMALIZATIONS += 1
+                continue
+
+        elif atype in (config.ACTION_PICK_UP, config.ACTION_USE, config.ACTION_DROP):
+            if not isinstance(a.get("item_id"), str) or not a.get("item_id"):
+                _SCHEMA_NORMALIZATIONS += 1
+                continue
+
+        elif atype == config.ACTION_GIVE:
+            if (not isinstance(a.get("item_id"), str) or not a.get("item_id") or
+                    not isinstance(a.get("target"), str) or not a.get("target")):
+                _SCHEMA_NORMALIZATIONS += 1
+                continue
+
+        elif atype == config.ACTION_WAIT:
+            original_duration = a.get("duration", 5)
+            normalized_duration = _safe_float(original_duration, 5.0)
+            if normalized_duration != original_duration:
+                _SCHEMA_NORMALIZATIONS += 1
+            a["duration"] = normalized_duration
+
+        normalized_actions.append(a)
+
+    clean["actions"] = normalized_actions
+    return _ORIG_VALIDATE_NPC_RESPONSE(clean)
+
+
 # Prompt-level ablations. They hide a feedback channel from the next LLM prompt
 # while leaving the underlying simulator state available for instrumentation.
 _ORIG_BUILD_NPC_PROMPT = llm_module.build_npc_prompt
@@ -236,7 +340,7 @@ def _instrumented_init(self, world):
 
 
 def _instrumented_response(self, entity_id, result):
-    global _VALID_DECISIONS
+    global _VALID_DECISIONS, _FAILED_DECISIONS
 
     e = self.world.entities.get(entity_id)
     before = _snapshot(e) if e else None
@@ -287,6 +391,7 @@ def _instrumented_response(self, entity_id, result):
         "llm_result": clean_result,
         "llm_result_raw": raw_result,
         "rejected_relationship_changes": rejected_relationships,
+        "schema_normalization_count_total": _SCHEMA_NORMALIZATIONS,
         "external_directive_present": bool(
             getattr(e2 or e, "pending_scheduler_message", None)
         ) if (e2 or e) else False,
@@ -306,7 +411,19 @@ def _instrumented_response(self, entity_id, result):
                 "type": "auto_stop",
                 "game_time": getattr(self.world, "game_time", None),
                 "valid_decisions": _VALID_DECISIONS,
+                "failed_decisions": _FAILED_DECISIONS,
                 "reason": "max_decisions_reached",
+            })
+            _post_quit_event()
+    else:
+        _FAILED_DECISIONS += 1
+        if _FAILED_DECISIONS > EXP.max_failed_decisions:
+            _write({
+                "type": "auto_stop",
+                "game_time": getattr(self.world, "game_time", None),
+                "valid_decisions": _VALID_DECISIONS,
+                "failed_decisions": _FAILED_DECISIONS,
+                "reason": "max_failed_decisions_exceeded",
             })
             _post_quit_event()
 
@@ -314,7 +431,7 @@ def _instrumented_response(self, entity_id, result):
 def _instrumented_execute(self, e, action):
     atype = action.get("type") if isinstance(action, dict) else None
     target_id = action.get("target") if isinstance(action, dict) else None
-    target = self.world.entities.get(target_id) if target_id else None
+    target = self.world.entities.get(target_id) if isinstance(target_id, str) else None
     target_mem_before = len(target.memories) if target else None
     communication_blocked = False
 
@@ -323,7 +440,7 @@ def _instrumented_execute(self, e, action):
         # utterance in the world event stream or the target's memory. This
         # removes the explicit agent-to-agent text propagation pathway.
         text = action.get("text", "")
-        e.say(text, time.time())
+        e.say(str(text), time.time())
         communication_blocked = True
     else:
         _ORIG_EXECUTE(self, e, action)
@@ -376,6 +493,7 @@ def _instrumented_interrupt(self, entity_id, message):
 
 
 def install_instrumentation() -> None:
+    llm_module.validate_npc_response = _research_validate_npc_response
     llm_module.build_npc_prompt = _instrumented_build_npc_prompt
     scheduler_module.Scheduler.__init__ = _instrumented_init
     scheduler_module.Scheduler._on_npc_response = _instrumented_response
@@ -393,8 +511,8 @@ if __name__ == "__main__":
         "experiment": _experiment_metadata(),
         "note": (
             "Base simulator files are unmodified. Research wrapper logs state, "
-            "enforces relationship target IDs, and applies only explicitly selected "
-            "experimental feedback ablations/treatments."
+            "hardens schema-invalid local-model output, enforces relationship target IDs, "
+            "and applies only explicitly selected experimental feedback ablations/treatments."
         ),
     })
     print(f"[research] recursive-drift log: {LOG_PATH}")
